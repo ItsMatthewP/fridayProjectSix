@@ -62,13 +62,13 @@ def fetch_reviews(conn):
         conn (sqlite3.Connection): The database connection object.
 
     Returns:
-        pd.DataFrame: A DataFrame containing the reviews with 'review_id' and 'text' columns.
+        pd.DataFrame: A DataFrame containing the reviews with 'id' and 'text' columns.
                       Returns an empty DataFrame if the table or column is not found.
     """
     # This query assumes your table is 'reviews' and the text column is 'review_text'
-    # It also assumes a unique id column, here aliased as 'review_id'
+    # It also assumes a unique id column, here aliased as 'id'
     # !! ADJUST THIS QUERY if your schema is different !!
-    query = "SELECT rowid as review_id, review_text as text FROM reviews"
+    query = "SELECT rowid as id, review_text as text FROM reviews"
     
     try:
         df = pd.read_sql_query(query, conn)
@@ -80,7 +80,7 @@ def fetch_reviews(conn):
     except pd.io.sql.DatabaseError as e:
         print(f"Error fetching reviews: {e}")
         print("Please check if a table named 'reviews' with a column 'review_text' exists in your database.")
-        return pd.DataFrame(columns=['review_id', 'text']) # Return empty DF on error
+        return pd.DataFrame(columns=['id', 'text']) # Return empty DF on error
 
 # --- OpenAI API Functions ---
 
@@ -138,14 +138,16 @@ def get_aspects(client, review_text):
               Returns empty list on failure or if no aspects are found.
     """
     system_prompt = (
-        "You are a product feedback analyst for the Apple Vision Pro. "
-        "Extract the specific features, product attributes, or aspects (e.g., 'eye tracking', 'battery life', 'comfort', 'price', 'display quality') mentioned in the review. "
+        "You are a product feedback analyst. "
+        "Extract specific features or aspects (e.g., 'eye tracking', 'battery life', 'comfort', 'price') mentioned in the review. "
         "For each aspect, determine the associated sentiment (Positive, Negative, or Neutral). "
-        "Return your answer as a valid JSON array of objects. Each object must have two keys: 'aspect' and 'sentiment'. "
-        "Example: [{\"aspect\": \"display quality\", \"sentiment\": \"Positive\"}, {\"aspect\": \"headband comfort\", \"sentiment\": \"Negative\"}] "
-        "If no specific aspects are mentioned, or if the review is too generic, return an empty array []."
+        "Return your answer as a single valid JSON object with one key: 'aspects'. "
+        "The value of 'aspects' MUST be an array of objects. Each object must have two keys: 'aspect' and 'sentiment'. "
+        "Example: {\"aspects\": [{\"aspect\": \"display quality\", \"sentiment\": \"Positive\"}, {\"aspect\": \"headband comfort\", \"sentiment\": \"Negative\"}]} "
+        "If no specific aspects are mentioned, or if the review is too generic, return {\"aspects\": []}."
     )
     
+    json_string = None # Initialize to None
     try:
         # Using a model that is good at following JSON instructions
         response = client.chat.completions.create(
@@ -158,27 +160,34 @@ def get_aspects(client, review_text):
             temperature=0.1
         )
         
-        # The API response with json_object type might be nested.
-        # Let's find the JSON part.
         json_string = response.choices[0].message.content
         
-        # The prompt asks for an array, but the model might wrap it in an object
-        # e.g., {"aspects": [...]}. We need to handle this.
+        if not json_string:
+            print("Warning: Received an empty response from API.")
+            return []
+
         parsed_json = json.loads(json_string)
         
-        # Try to find the list of aspects
-        if isinstance(parsed_json, list):
+        # New, more robust parsing logic:
+        # We explicitly asked for {"aspects": [...]}, so let's look for that.
+        if isinstance(parsed_json, dict) and 'aspects' in parsed_json and isinstance(parsed_json['aspects'], list):
+            aspect_list = parsed_json['aspects']
+        # Fallback: Maybe it just returned the list directly?
+        elif isinstance(parsed_json, list):
+            print("Warning: API returned a raw list, not the expected object. Processing list.")
             aspect_list = parsed_json
+        # Fallback: Maybe it returned an object with a *different* key that contains a list?
         elif isinstance(parsed_json, dict):
-            # Find the first value in the dict that is a list
             found_list = None
             for key, value in parsed_json.items():
                 if isinstance(value, list):
                     found_list = value
+                    print(f"Warning: Found list under unexpected key '{key}'. Processing.")
                     break
             if found_list is not None:
                 aspect_list = found_list
             else:
+                # This is the warning the user was seeing
                 print(f"Warning: JSON response was a dict but contained no list: {json_string}")
                 return []
         else:
@@ -199,7 +208,8 @@ def get_aspects(client, review_text):
         return validated_list
 
     except json.JSONDecodeError:
-        print(f"Error: Failed to decode JSON from API response: {json_string}")
+        # This is the other error the user was seeing
+        print(f"Error: Failed to decode JSON from API response. Response text: {json_string}")
         return []
     except Exception as e:
         print(f"Error during aspect extraction API call: {e}")
@@ -411,7 +421,7 @@ def main():
     print(f"\nAnalyzing {total_reviews} reviews...")
     
     for index, row in reviews_df.iterrows():
-        print(f"  Processing review {index + 1} of {total_reviews} (ID: {row['review_id']})...")
+        print(f"  Processing review {index + 1} of {total_reviews} (ID: {row['id']})...")
         
         # --- Rate Limiting ---
         # Add a short delay to avoid hitting API rate limits
@@ -428,9 +438,9 @@ def main():
             # We can use a slightly faster delay for the second call
             time.sleep(0.5) 
             aspects = get_aspects(client, row['text'])
-            # Add review_id to each aspect for easier tracking
+            # Add id to each aspect for easier tracking
             for aspect_dict in aspects:
-                aspect_dict['review_id'] = row['review_id']
+                aspect_dict['id'] = row['id']
                 all_aspects.append(aspect_dict)
 
     print("\nAnalysis complete.")
